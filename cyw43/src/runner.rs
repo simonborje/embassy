@@ -1,5 +1,9 @@
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::Ordering::Relaxed;
+
 use embassy_futures::select::{Either4, select4};
 use embassy_net_driver_channel as ch;
+use embassy_net_driver_channel::driver::LinkState;
 use embassy_time::{Duration, Timer, block_for};
 use embedded_hal_1::digital::OutputPin;
 
@@ -46,6 +50,11 @@ pub struct Runner<'a, PWR, SPI> {
 
     events: &'a Events,
 
+    secure_network: &'a AtomicBool,
+    link_ok: bool,
+    auth_ok: bool,
+    password_ok: bool,
+
     #[cfg(feature = "firmware-logs")]
     log: LogState,
 
@@ -63,6 +72,7 @@ where
         bus: Bus<PWR, SPI>,
         ioctl_state: &'a IoctlState,
         events: &'a Events,
+        secure_network: &'a AtomicBool,
         #[cfg(feature = "bluetooth")] bt: Option<crate::bluetooth::BtRunner<'a>>,
     ) -> Self {
         Self {
@@ -73,6 +83,10 @@ where
             sdpcm_seq: 0,
             sdpcm_seq_max: 1,
             events,
+            secure_network,
+            link_ok: false,
+            auth_ok: false,
+            password_ok: false,
             #[cfg(feature = "firmware-logs")]
             log: LogState::default(),
             #[cfg(feature = "bluetooth")]
@@ -488,13 +502,50 @@ where
                     return;
                 }
 
-                let evt_type = events::Event::from(event_packet.msg.event_type as u8);
+                let evt_type = Event::from(event_packet.msg.event_type as u8);
+                let status = EStatus::from(event_packet.msg.status as u8);
                 debug!(
                     "=== EVENT {:?}: {:?} {:02x}",
                     evt_type,
                     event_packet.msg,
                     Bytes(evt_data)
                 );
+
+                let mut update_link_status = true;
+                match (evt_type, status, event_packet.msg.flags) {
+                    (Event::LINK, EStatus::SUCCESS, 1) => self.link_ok = true,
+                    (Event::LINK, EStatus::SUCCESS, 0) => self.link_ok = false,
+                    (Event::AUTH, EStatus::SUCCESS, 0) => self.auth_ok = true,
+                    (Event::AUTH, event_status, 0) if event_status != EStatus::UNSOLICITED => {
+                        self.auth_ok = false
+                    }
+                    (Event::DEAUTH, EStatus::SUCCESS, _) => self.auth_ok = false,
+                    // Status 6 ("UNSOLICITED") for PSK_SUP events appears to indicate successful handshake
+                    (Event::PSK_SUP, EStatus::UNSOLICITED, _) => self.password_ok = true,
+                    (Event::PSK_SUP, _, _) => self.password_ok = false,
+                    _ => update_link_status = false,
+                }
+
+                if update_link_status {
+                    let secure_network = self.secure_network.load(Relaxed);
+                    let link_state =
+                        if self.link_ok && self.auth_ok && (!secure_network || self.password_ok) {
+                            LinkState::Up
+                        } else {
+                            LinkState::Down
+                        };
+
+                    self.ch.set_link_state(link_state);
+
+                    debug!(
+                        "link: {}, auth: {}, secure_network: {}, password_ok: {}, link_state {}",
+                        self.link_ok as u8,
+                        self.auth_ok as u8,
+                        secure_network as u8,
+                        self.password_ok as u8,
+                        link_state as u8
+                    );
+                }
 
                 if self.events.mask.is_enabled(evt_type) {
                     let status = event_packet.msg.status;

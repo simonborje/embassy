@@ -1,5 +1,6 @@
 use core::cmp::{max, min};
 use core::iter::zip;
+use core::sync::atomic::AtomicBool;
 
 use embassy_net_driver_channel as ch;
 use embassy_net_driver_channel::driver::{HardwareAddress, LinkState};
@@ -33,6 +34,7 @@ pub struct Control<'a> {
     state_ch: ch::StateRunner<'a>,
     events: &'a Events,
     ioctl_state: &'a IoctlState,
+    secure_network: &'a AtomicBool,
 }
 
 /// WiFi scan type.
@@ -154,11 +156,17 @@ impl<'a> Default for JoinOptions<'a> {
 }
 
 impl<'a> Control<'a> {
-    pub(crate) fn new(state_ch: ch::StateRunner<'a>, event_sub: &'a Events, ioctl_state: &'a IoctlState) -> Self {
+    pub(crate) fn new(
+        state_ch: ch::StateRunner<'a>,
+        event_sub: &'a Events,
+        ioctl_state: &'a IoctlState,
+        secure_network: &'a AtomicBool,
+    ) -> Self {
         Self {
             state_ch,
             events: event_sub,
             ioctl_state,
+            secure_network,
         }
     }
 
@@ -367,6 +375,8 @@ impl<'a> Control<'a> {
         };
         i.ssid[..ssid.len()].copy_from_slice(ssid.as_bytes());
 
+        let auth = options.auth != JoinAuth::Open;
+        self.secure_network.store(auth, core::sync::atomic::Ordering::Relaxed);
         self.wait_for_join(i).await
     }
 
