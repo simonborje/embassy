@@ -1,5 +1,9 @@
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::Ordering::Relaxed;
+
 use embassy_futures::select::{Either4, select4};
 use embassy_net_driver_channel as ch;
+use embassy_net_driver_channel::driver::LinkState;
 use embassy_time::{Duration, Timer, block_for};
 use embedded_hal_1::digital::OutputPin;
 
@@ -46,6 +50,10 @@ pub struct Runner<'a, PWR, SPI> {
 
     events: &'a Events,
 
+    secure_network: &'a AtomicBool,
+    join_status: bool,
+    keys_exchanged_status: bool,
+
     #[cfg(feature = "firmware-logs")]
     log: LogState,
 
@@ -63,6 +71,7 @@ where
         bus: Bus<PWR, SPI>,
         ioctl_state: &'a IoctlState,
         events: &'a Events,
+        secure_network: &'a AtomicBool,
         #[cfg(feature = "bluetooth")] bt: Option<crate::bluetooth::BtRunner<'a>>,
     ) -> Self {
         Self {
@@ -73,6 +82,9 @@ where
             sdpcm_seq: 0,
             sdpcm_seq_max: 1,
             events,
+            secure_network,
+            join_status: false,
+            keys_exchanged_status: false,
             #[cfg(feature = "firmware-logs")]
             log: LogState::default(),
             #[cfg(feature = "bluetooth")]
@@ -488,17 +500,57 @@ where
                     return;
                 }
 
-                let evt_type = events::Event::from(event_packet.msg.event_type as u8);
+                let event_type = Event::from(event_packet.msg.event_type as u8);
+                let status = EStatus::from(event_packet.msg.status as u8);
                 debug!(
                     "=== EVENT {:?}: {:?} {:02x}",
-                    evt_type,
+                    event_type,
                     event_packet.msg,
                     Bytes(evt_data)
                 );
 
-                if self.events.mask.is_enabled(evt_type) {
+                let mut update_link_status = true;
+                match (event_type, status, event_packet.msg.flags, event_packet.msg.reason) {
+                    // Ignore unsolicited and successful AUTH messages
+                    (Event::AUTH, EStatus::UNSOLICITED | EStatus::SUCCESS, ..) => {}
+                    // Events indicating that the connection is down
+                    (Event::LINK, EStatus::SUCCESS, 0, _)
+                    | (Event::DEAUTH, EStatus::SUCCESS, ..)
+                    | (Event::AUTH, ..) => {
+                        self.join_status = false;
+                        // On a secure network, a new key exchange must happen if the link has gone down
+                        self.keys_exchanged_status = false;
+                    }
+                    // Successfully joined the network - this is enough for open networks, but secure networks also require a successful key exchange
+                    (Event::JOIN, EStatus::SUCCESS, ..) => self.join_status = true,
+                    // Successful key exchange, indicated by PSK_SUP event with status 6 "UNSOLICITED", flags 0, and reason 0
+                    (Event::PSK_SUP, EStatus::UNSOLICITED, 0, 0) => self.keys_exchanged_status = true,
+                    (Event::PSK_SUP, ..) => self.keys_exchanged_status = false,
+                    _ => update_link_status = false,
+                }
+
+                if update_link_status {
+                    let secure_network = self.secure_network.load(Relaxed);
+                    let link_state = if self.join_status && (!secure_network || self.keys_exchanged_status) {
+                        LinkState::Up
+                    } else {
+                        LinkState::Down
+                    };
+
+                    self.ch.set_link_state(link_state);
+
+                    debug!(
+                        "join_status: {}, secure_network: {}, password_ok: {}, link_state {}",
+                        self.join_status as u8,
+                        secure_network as u8,
+                        self.keys_exchanged_status as u8,
+                        link_state as u8
+                    );
+                }
+
+                if self.events.mask.is_enabled(event_type) {
                     let status = event_packet.msg.status;
-                    let event_payload = match evt_type {
+                    let event_payload = match event_type {
                         Event::ESCAN_RESULT if status == EStatus::PARTIAL => {
                             let Some((_, bss_info)) = ScanResults::parse(evt_data) else {
                                 return;
@@ -519,13 +571,7 @@ where
                     self.events
                         .queue
                         .immediate_publisher()
-                        .publish_immediate(events::Message::new(
-                            Status {
-                                event_type: evt_type,
-                                status,
-                            },
-                            event_payload,
-                        ));
+                        .publish_immediate(events::Message::new(Status { event_type, status }, event_payload));
                 }
             }
             CHANNEL_TYPE_DATA => {

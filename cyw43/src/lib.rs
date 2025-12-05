@@ -23,6 +23,8 @@ mod runner;
 mod structs;
 mod util;
 
+use core::sync::atomic::AtomicBool;
+
 use embassy_net_driver_channel as ch;
 use embedded_hal_1::digital::OutputPin;
 use events::Events;
@@ -31,7 +33,7 @@ use ioctl::IoctlState;
 use crate::bus::Bus;
 pub use crate::bus::SpiBusCyw43;
 pub use crate::control::{
-    AddMulticastAddressError, Control, Error as ControlError, JoinAuth, JoinOptions, ScanOptions, ScanType, Scanner,
+    AddMulticastAddressError, Control, JoinError, JoinAuth, JoinOptions, ScanOptions, ScanType, Scanner,
 };
 pub use crate::runner::Runner;
 pub use crate::structs::BssInfo;
@@ -121,6 +123,7 @@ pub struct State {
 struct NetState {
     ch: ch::State<MTU, 4, 4>,
     events: Events,
+    secure_network: AtomicBool,
 }
 
 impl State {
@@ -131,6 +134,7 @@ impl State {
             net: NetState {
                 ch: ch::State::new(),
                 events: Events::new(),
+                secure_network: AtomicBool::new(false),
             },
             #[cfg(feature = "bluetooth")]
             bt: bluetooth::BtState::new(),
@@ -249,12 +253,13 @@ where
         Bus::new(pwr, spi),
         &state.ioctl_state,
         &state.net.events,
+        &state.net.secure_network,
         #[cfg(feature = "bluetooth")]
         None,
     );
 
     runner.init(firmware, None).await;
-    let control = Control::new(state_ch, &state.net.events, &state.ioctl_state);
+    let control = Control::new(state_ch, &state.net.events, &state.ioctl_state, &state.net.secure_network);
 
     (device, control, runner)
 }
